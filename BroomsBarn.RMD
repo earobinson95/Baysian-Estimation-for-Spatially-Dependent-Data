@@ -1,0 +1,396 @@
+---
+title: "Spatial- BroomsBarn"
+author: "Emily Robinson"
+date: "April 30, 2018"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(yaImpute)
+library(spBayes)
+library(MBA)
+library(geoR)
+library(fields)
+library(rgdal)
+library(RgoogleMaps)
+library(raster)
+library(dplyr)
+library(leaps)
+library(MASS)
+library(PerformanceAnalytics)
+library(plotly)
+```
+
+## Research Proposal
+
+The data I am working with was found at http://www.kriging.com/datasets/. Given on page 10 in the supproting file (http://www.kriging.com/books/Chapter1_PG2000_CS.pdf) is the following data description 
+
+*This is a soil science application, data supplied by Dick Webster - co-author of Webster & Oliver's excellent 'Geostatistics for Environmental Scientists'. Brooms Barn is an agricultural experimental station in East Anglia (UK) which hosts several fields within its area. The data set includes Potassium (K mg/l), Phosphorus (P mg/l) and pH levels in the soil. Over 400 samples were collected on a regular grid at 40 metres spacing.*
+
+*The data file consists of 434 samples and the following fields for each sample*
+
+* *East and North position on the sampling grid - this is not in metres but in grid spacing, i.e. 1 unit of distance equals 40 metres;*
+* *K - potassium value in the soil, mg/l;*
+* *log10 K - logarithms to the base 10 of K values;*
+* *pH - universal measurements for acidity (or lack of) in the soil;*
+* *P - phosphorus levels in the soil, mg/l;*
+* *log10 P - logarithm to the base 10 for P values.*
+
+In the data file, the researchers identified right skewness of potassium (K) and phosphorus (P) as they accounted for this by logging both variables. In my analysis I will address this separately and determine the need to do a transformation on these variables and explore any outliers that may be causing the major skewness.
+
+After exploring the data, I will do an analysis of the acidity (pH) values using bayesian estimation. My analysis will include:
+
+* Developing the "best" model by determining which predictors should be included in the model as well as comparing the spatial and non-spatial model.
+* Fitting the model on a training set with Bayesian methods.
+* Prdicting the pH at the testing set locations and comparing these to the actual values.
+
+## Data Exploration
+
+```{r DataSetup, echo = FALSE}
+BroomsBarn_full <- read.table('BroomsBarn.dat', header = F, skip = 4)
+colnames(BroomsBarn_full) <- c('East', 'North', 'K', 'log10K', 'pH', 'P', 'log10P')
+summary(BroomsBarn_full)
+```
+
+Observing the correlation chart below, we determine two outliers as well as right skewness in both the K and P values. We also have reason to beleive there is left skewness in our response variable (pH).
+
+```{r Correlation, echo = FALSE}
+chart.Correlation(cbind((BroomsBarn_full$pH), BroomsBarn_full[,-c(1,2,5)]))
+```
+
+Using the "plotyly" package to determine where the outliers are, we identify two outliers where $log10P = -9$ and remove them from the dataset.
+
+```{r Outliers, echo = FALSE, catch = FALSE, warning = FALSE, message = FALSE, error = FALSE}
+plot_ly(BroomsBarn_full, x = ~log10K, y = ~log10P)
+BroomsBarn <- BroomsBarn_full %>%
+              filter(log10P != -9)
+```
+
+Exploring the transformation of both the explanatory variables (K and P) as well as our response variable (pH) we determine that logging K and P is appropriate and using BoxCox transformation determine $(\lambda \approx1.85)$ and that squaring pH would be an appropriate transformation. The final correlation plot to be used in my model is shown below.
+
+```{r Transformations, echo = FALSE, message = FALSE}
+par(mfrow=c(2,2))
+hist(BroomsBarn$K) # -> log it.
+hist(BroomsBarn$P) # -> log it.
+hist(BroomsBarn$pH)
+geodata <- as.geodata(BroomsBarn, coords.col = 1:2, data.col = 5)
+X <- as.matrix(BroomsBarn[,c(4,7)])
+boxcox(geodata, trend = ~ X)
+par(mfrow=c(1,1))
+chart.Correlation(cbind((BroomsBarn$pH)^2, BroomsBarn[,-c(1,2,3,5,6)]))
+```
+To continue the analysis, I split my dataset into a training set (303 observations) and testing set (130 observations).
+
+```{r CrossValidation, echo = FALSE, message = FALSE}
+set.seed(22)
+sIndx   <- sample(1:nrow(BroomsBarn), 0.7*nrow(BroomsBarn))
+BroomsBarn.train <- BroomsBarn[sIndx,]
+s.train <- as.matrix( BroomsBarn.train[,1:2])
+y.train <- as.matrix(BroomsBarn.train$pH)
+X.train <- as.matrix(BroomsBarn.train[,c(4,7)])
+n.train <- nrow(BroomsBarn.train)
+y.train <- y.train^2
+
+BroomsBarn.test  <- BroomsBarn[-sIndx,]
+s.test <- as.matrix(BroomsBarn.test[,1:2])
+y.test <- as.matrix(BroomsBarn.test$pH)
+X.test <- as.matrix(BroomsBarn.test[,c(4,7)])
+n.test <- nrow(BroomsBarn.test)
+y.test  <- y.test^2
+```
+
+Visualizing the pH levels of the training dataset on the model scale (i.e. $pH^2$) and the residuals of the initial linear model as shown below, there appears to be spatial dependance among the data.
+
+```{r SpatialVisualization1, echo = FALSE, message = FALSE}
+par(mfrow=c(1,2))
+#plot(s.train, pch = 15, col = "navy", cex = 0.5, xlab = "Easting", ylab = "Northing")
+surf <- mba.surf(as.matrix(cbind(s.train, sqrt(y.train))), no.X = n.train, no.Y = n.train, extend = FALSE)$xyz.est
+image.plot(surf, xaxs = "r", yaxs = "r", xlab = "Easting", ylab = "Northing", main = "Observed pH")
+points(BroomsBarn.train[,1:2], pch = 1)
+
+#RESIDUALS
+ns_mod <- lm(sqrt(y.train) ~ X.train)
+ns_mod_resid <- resid(ns_mod)
+
+#PLOT WITHOUT SPATIAL DEPENDENCE
+resid.surf <- mba.surf(as.matrix(cbind(s.train, ns_mod_resid)),
+                       no.X = n.train, no.Y = n.train,
+                       extend = FALSE)$xyz.est
+image.plot(resid.surf, xaxs = "r", yaxs = "r", xlab = "Easting", ylab = "Northing", main = "Residuals")
+par(mfrow=c(1,1))
+```
+Comparing the 2D interpolated plots of potassium and phosphorus as well there appears to be a realtion between the potassium levels and the pH.
+```{r SpatialVisualization2, echo = FALSE, message = FALSE}
+par(mfrow=c(1,2))
+surf <- mba.surf(as.matrix(cbind(s.train, X.train[,1])), no.X = n.train, no.Y = n.train, extend = FALSE)$xyz.est
+image.plot(surf, xaxs = "r", yaxs = "r", xlab = "Easting", ylab = "Northing", main = "Transformed K (log10K)")
+points(BroomsBarn.train[,1:2], pch = 1)
+
+surf <- mba.surf(as.matrix(cbind(s.train, X.train[,2])), no.X = n.train, no.Y = n.train, extend = FALSE)$xyz.est
+image.plot(surf, xaxs = "r", yaxs = "r", xlab = "Easting", ylab = "Northing", main = "Transformed P (log10P)")
+points(BroomsBarn.train[,1:2], pch = 1)
+par(mfrow=c(1,1))
+```
+
+##Model Selection
+
+```{r ModelSelection, echo = FALSE, message = FALSE}
+b <- regsubsets(x = X.train, y = y.train)
+rs <- summary(b)
+rs$outmat
+
+om1 <- lm(y.train ~ X.train[,2])
+om2 <- lm(y.train ~ X.train)
+om  <- list(om1, om2)
+
+m    <- ncol(X.train)
+AIC <- sapply(1:m, function(x) round(extractAIC(om[[x]],k=2)[2],2))
+AIC
+BIC <- sapply(1:m, function(x) round(extractAIC(om[[x]],k=log(n.train))[2],2))
+BIC
+
+myPRESS <- function(x,y,indx){
+  m1 <- lm(y~x[,indx])
+  press <- sum((m1$residuals/(1-hatvalues(m1)))^2)
+  return(press)
+}
+PRESS.indx <- matrix("", nrow = m, ncol = m)
+colnames(PRESS.indx) <- c("log10K", "log10P")
+PRESS <- rep(0,m)
+for(i in 1:m)
+{
+  indx <- combn(m,i)
+  n.indx <- ncol(indx)
+  tmp <- sapply(1:n.indx, function(m) myPRESS(as.matrix(X.train), as.matrix(y.train), indx[,m]))
+  PRESS[i] <- round(min(tmp),2)
+  PRESS.indx[i, indx[,which.min(tmp)]] <- "*"
+}
+PRESS.indx
+PRESS
+```
+According to AIC, BIC, and PRESS, we conclude that including both postassium (K) and phosphorus (P) as predictors is appropriate. Therefore, our non-spatial model is given by:
+$$\textbf{Y(s)}=\beta_0+\beta_1\textbf{x}_1\textbf{(s)}+\beta_2\textbf{x}_2\textbf{(s)}+\epsilon\textbf{(s)}$$
+where $\textbf{Y(s)}$ is $pH^2$, $\textbf{x}_1\textbf{(s)}$ is $log10K$, and $\textbf{x}_2\textbf{(s)}$ is $log10P$ the at location s, with $\epsilon\textbf{(s)}$ independent of location s with mean zero and variance $\sigma_\epsilon^2$.
+
+##Spatial vs NonSpatial Model
+Since there is reasoning to beleive there is spatial dependance in the residual plot above, we use the variogram methods and fit the data with an "exponential" covariance function.
+```{r Variograms, echo = FALSE , message = FALSE, cache = FALSE}
+max.dist <- 0.5 * max(iDist(s.train))
+m1 <- lm(y.train~X.train)
+m1.sum <- summary(m1)
+
+#apply variogram methods
+bins <- 100
+
+#Matheron estimator
+vario.M <- variog(coords = s.train, data = y.train, trend = ~X.train,
+                  estimator.type = "classical", uvec = (seq(0, max.dist, l = bins )))
+
+#Cressie-Hawkins estimator
+vario.CH <- variog(coords = s.train, data = y.train, trend = ~X.train,
+                   estimator.type = "modulus", uvec = (seq(0, max.dist, l = bins )))
+par(mfrow=c(1,2))
+plot(vario.M, main = "y")
+points(vario.CH$u, vario.CH$v, col = "red")
+legend("bottomright", legend=c("Matheron", "Cressie-Hawkins"), pch = c(1,1),
+       col = c("black", "red"), cex = 0.6)
+
+#WLS with weights N(h)/gamma^2(h)
+fit.vario <- variofit(vario.M, ini.cov.pars = c(m1.sum$sigma^2,
+                                                -max.dist/log(0.05)), cov.model = "exponential", minimisation.function
+                      = "optim", weights = "cressie", control = list(factr=1e-10, maxit = 500),
+                      messages = FALSE)
+
+plot(vario.M, main="y")
+lines(fit.vario)
+abline(h=fit.vario$nugget, col="blue")##nugget
+abline(h=fit.vario$cov.pars[1]+fit.vario$nugget, col="green")##sill
+abline(v=-log(0.05)*fit.vario$cov.pars[2], col="red3")##effective range
+par(mfrow=c(1,1))
+fit.vario
+```
+
+Next, I compared the bayesian non-spatial model to the spatial bayesian model with noninformative priors to formally determine the existence of spatial dependance.
+
+```{r SpatialvsNonSpatial1, echo = FALSE, include = FALSE, message = FALSE}
+#BAYES NONSPATIAL--------------------------------------------------------
+n.samples <- 30000
+burn.in <- 0.75*n.samples
+m2.nsp <- bayesLMRef(om2, n.samples)
+burn.in <- 0.75*n.samples
+m2.nsp.Diag <- spDiag(m2.nsp, verbose = F)
+DIC.nsp <- m2.nsp.Diag$DIC
+GP.nsp <- m2.nsp.Diag$GP
+
+#MSPR prediction at s.test
+pred.nsp <- spPredict(m2.nsp, start = burn.in, thin = 10, pred.covars = cbind(1,X.test))
+#posterior predictor values
+pred.nsp.summary <- apply(pred.nsp$p.y.predictive.samples, 1, function (x){quantile(x, prob = c(0.025, 0.5, 0.975))})
+MSPR.nsp <- mean((pred.nsp.summary[2,]-y.test)^2)
+
+#BAYES SPATIAL-------------------------------------------------------
+starting <- list("phi"=fit.vario$cov.pars[2], "sigma.sq"=
+                   fit.vario$cov.pars[1], "tau.sq"=fit.vario$nugget)
+tuning <- list("phi"=.5, "sigma.sq"=0.01, "tau.sq"=0.01)
+p <- 3
+dis <- iDist(s.train)
+max.dist <- max(dis)
+min.dist <- min(dis[dis!=0])
+priors <- list("beta.Norm"=list(rep(0,3), diag(10000000,p)),
+               "phi.Unif"=c(-log(0.05)/max.dist, -log(0.01)/min.dist),
+               "sigma.sq.IG"=c(2,fit.vario$cov.pars[1]),
+               "tau.sq.IG"=c(2,fit.vario$nugget))
+m2.sp <- spLM(y.train~X.train, coords = s.train, 
+              starting = starting, tuning = tuning, priors = priors, cov.model = "exponential",
+              n.samples = n.samples, n.report=floor(n.samples/4))
+m2.sp <- spRecover(m2.sp, start=burn.in, thin=10, verbose=F)
+m2.sp.Diag <- spDiag(m2.sp, verbose = F)
+DIC.sp <- m2.sp.Diag$DIC
+GP.sp <- m2.sp.Diag$GP
+
+#MSPR
+pred.sp <- spPredict(m2.sp, start = burn.in, thin = 10, pred.coords = s.test, cbind(1,X.test))
+
+pred.sp.summary <- apply(pred.sp$p.y.predictive.samples, 1, function (x){quantile(x, prob = c(0.025, 0.5, 0.975))})
+MSPR.sp <- mean((pred.sp.summary[2,]-y.test)^2)
+```
+
+
+```{r SpatialvsNonSpatial2, echo = FALSE, message = FALSE}
+#SPATIAL VS NONSPATIAL----------------------------------------------------
+print(cbind(DIC.nsp, DIC.sp))
+print(cbind(MSPR.nsp, MSPR.sp))
+
+#plots for comparing the prediction performance of spatial vs non-spatial models
+par(mfrow=c(1,2))
+#plots comparing observed vs prediction of non-spatial models
+a<-min(c(pred.nsp.summary, pred.sp.summary, y.test))
+b<-max(c(pred.nsp.summary, pred.sp.summary, y.test))+8
+n.test <- length(y.test)
+indx <- order(pred.nsp.summary[2,])
+plot(c(1:n.test),y.test[indx], typ="l",ylim=c(a,b),xlab=NA,ylab=NA, main = "non-spatial prediction")
+#fitted quantiles 0.025,0.5,0.975
+polygon(c(c(1:n.test),rev(c(1:n.test))),c(pred.nsp.summary[1, indx],rev(pred.nsp.summary[3, indx])),col="grey90",border=FALSE)
+lines(c(1:n.test),y.test[indx],lty=1,col="black")
+lines(c(1:n.test),pred.nsp.summary[1, indx],lty=2,col="grey60")
+lines(c(1:n.test),pred.nsp.summary[2, indx],lty=4,col="red")
+lines(c(1:n.test),pred.nsp.summary[3, indx],lty=2,col="grey60")
+legend("topleft",c("95% credible band","predicted","obs"),lty=c(2,4,1),lwd=c(2.5,2.5),col=c("grey60","red","black"), cex = 0.7);
+
+#plots comparing observed vs prediction of spatial models
+indx <- order(pred.sp.summary[2,])
+plot(c(1:n.test),y.test[indx], typ="l",ylim=c(a,b),xlab=NA,ylab=NA, main = "spatial prediction")
+#fitted quantiles 0.025,0.5,0.975
+polygon(c(c(1:n.test),rev(c(1:n.test))),c(pred.sp.summary[1, indx],rev(pred.sp.summary[3, indx])),col="grey90",border=FALSE)
+lines(c(1:n.test),y.test[indx],lty=1,col="black")
+lines(c(1:n.test),pred.sp.summary[1, indx],lty=2,col="grey60")
+lines(c(1:n.test),pred.sp.summary[2, indx],lty=4,col="red")
+lines(c(1:n.test),pred.sp.summary[3, indx],lty=2,col="grey60")
+legend("topleft",c("95% credible band","predicted","obs"),lty=c(2,4,1),lwd=c(2.5,2.5),col=c("grey60","red","black"), cex = 0.7)
+```
+
+Based on our DIC and MSPR, we determine spatial dependance when modeling pH. Recall from above, $Y(s)=pH^2$ at location s, and let $X(s)=(1,X_1(s),X_2(s))^T$ and $\beta=(\beta_0, \beta_1, \beta_2)^T$. Thus, my final model is given by:
+
+$$\text{data model: } Y(s)|\beta,w(s),\sigma_e^2 \text{ ind } \sim Gaussian(X(s)^T\beta+w(s),\sigma_e^2)$$
+$$\text{process model: } w(s)|\sigma_w^2, \phi \sim Gaussian(0, C(h;\sigma_w^2, \phi))$$
+$$\text{parameter model: } p(\beta)p(\sigma_w^2)p(\phi)p(\sigma_e^2)$$
+where $C(h;\sigma_w^2, \phi)=\sigma_w^2e^{-\phi||h||}, p(\beta) \sim Gaussian(0,10^6I), p(\sigma_w^2)$ and $p(\sigma_e^2)$ are usually inverse Gamma with hyperparameter $a=2$ and $b$ the estimated $\sigma_w^2=63.58$ and $\sigma_e^2=7.09$ respectively from variogram methods above, and $p(\phi)$ is a uniform prior within $(-log(0.05)/d_max,-log(0.01)/d_min),$ where $d_max$ and $d_min$ are maximum and minimum distance accross all pairs of locations in the training set.
+
+##Bayesian Estimation
+Continuing to use the training dataset, I ran three adaptive MCMC chains with different initial values. Observing the plots below, we determine the three chains converge to the same distribution and use the gelman plots to determine the burn-in period to be 15,000 iterations.
+
+```{r BayesianEstimation1, include = FALSE, echo = FALSE, message = FALSE}
+#use exponential covariance. In spBayes package, exponential covariance
+#is defined as C(h) = \sigma^2 e^{-\phi |h|}.
+coords <- s.train
+y <- y.train
+X <- X.train
+
+n.samples <- 30000
+#pick the variogram estimate as the starting value.
+
+starting.1 <- list("phi"=1/fit.vario$cov.pars[2], 
+                   "sigma.sq"=fit.vario$cov.pars[1], 
+                   "tau.sq"=fit.vario$nugget)
+starting.2 <- list("phi"=1/fit.vario$cov.pars[2]*2, 
+                   "sigma.sq"=fit.vario$cov.pars[1]*2, 
+                   "tau.sq"=fit.vario$nugget*2)
+starting.3 <- list("phi"=1/fit.vario$cov.pars[2]*3, 
+                   "sigma.sq"= fit.vario$cov.pars[1]*3, 
+                   "tau.sq"=fit.vario$nugget*3)
+tuning <- list("phi"=0.5, "sigma.sq"=0.01, "tau.sq"=0.01)
+p <- ncol(X)+1
+dis <- iDist(coords)
+max.dist <- max(dis)
+min.dist <- min(dis[dis!=0])
+priors <- list("beta.Norm"=list(rep(0,p), diag(1000000,p)),
+               "phi.Unif"=c(-log(0.05)/max.dist, -log(0.01)/min.dist),
+               "sigma.sq.IG"=c(2, fit.vario$cov.pars[1]),  "tau.sq.IG"=c(2, fit.vario$nugget))
+
+m.1 <- spLM(y ~ X, coords=coords, starting=starting.1,
+            tuning=tuning, priors=priors, cov.model="exponential",
+            n.samples=n.samples, n.report=1000)
+m.2 <- spLM(y ~ X, coords=coords, starting=starting.2,
+            tuning=tuning, priors=priors, cov.model="exponential",
+            n.samples=n.samples, n.report=1000)
+m.3 <- spLM(y ~ X, coords=coords, starting=starting.3,
+            tuning=tuning, priors=priors, cov.model="exponential",
+            n.samples=n.samples, n.report=1000)
+```
+
+```{r BayesianEstimation2, echo = FALSE, message = FALSE}
+#determine burn in
+burn.in <- 15000
+samps <- mcmc.list(m.1$p.theta.samples,
+                   m.2$p.theta.samples,
+                   m.3$p.theta.samples)
+
+gelman.plot(samps)
+print(gelman.diag(samps))
+plot(samps)
+
+#get beta and spatial random field w
+m.1 <- spRecover(m.1, start=burn.in, thin=10, verbose=FALSE)
+m.2 <- spRecover(m.2, start=burn.in, thin=10, verbose=FALSE)
+m.3 <- spRecover(m.3, start=burn.in, thin=10, verbose=FALSE)
+
+#summary of theta
+theta.samps <- mcmc.list(m.1$p.theta.recover.samples, m.2$p.theta.recover.samples, m.3$p.theta.recover.samples)
+round(summary(theta.samps)$quantiles,3)
+
+#posterior sample of beta
+beta.samps <- mcmc.list(m.1$p.beta.recover.samples, m.2$p.beta.recover.samples, m.3$p.beta.recover.samples)
+round(summary(beta.samps)$quantiles,3)
+```
+
+##Prediction
+```{r Prediction1, include = FALSE, echo = FALSE, message = FALSE}
+pred <- spPredict(m.1, start = burn.in, thin = 10, 
+                  pred.coords = s.test, 
+                  pred.covars = cbind(1,X.test))
+```
+
+```{r Prediction2, echo = FALSE, message = FALSE}
+#posterior predicted value and prediction interval
+pred.summary <- apply(pred$p.y.predictive.samples, 1, function(x){quantile(x, prob=c(0.025,0.5,0.975))})
+
+par(mfrow=c(1,2))
+y.pred <- sqrt(pred.summary[2,])
+surf <- mba.surf(as.matrix(cbind(s.test, y.pred)), no.X = n.test, no.Y = n.test, extend = FALSE)$xyz.est
+image.plot(surf, xaxs = "r", yaxs = "r", xlab = "Easting", ylab = "Northing", main = "Posterior Predicted Median pH")
+points(s.test, pch = 1)
+
+rng95 <- sqrt(pred.summary[3,])-sqrt(pred.summary[1,])
+surf <- mba.surf(as.matrix(cbind(s.test, rng95)), no.X = n.test, no.Y = n.test, extend = FALSE)$xyz.est
+image.plot(surf, xaxs = "r", yaxs = "r", xlab = "Easting", ylab = "Northing", main = "Posterior Predicted 95% CI pH")
+points(s.test, pch = 1)
+par(mfrow=c(1,1))
+
+plot(sqrt(y.test), y.pred)
+abline(0,1)
+```
+
+Observing the predicted vs actual plot and residuals above we can see that our accuracy has increased and continue to look into the patterns. The typical pH range of soil is between 5.5 and 7. Observing the sampling grid we observe many acidic plots. However, where the residual range appears to be the highest there are three feilds or plots in the top that are more alkaline than acidic and fall within the desired soil pH range. This could be due to limestone being installed in these few plots causing the pH to decrease for ideal planting conditions.
